@@ -34,6 +34,8 @@ def find_primes(n_min=190, n_max=1000, count=10):
              if is_prime(p) and p % 8 == 7]
     if len(all_p) <= count:
         return all_p
+    if count == 1:
+        return [all_p[len(all_p) // 2]]
     # Evenly spaced selection
     step = (len(all_p) - 1) / (count - 1)
     selected = [all_p[round(i * step)] for i in range(count)]
@@ -77,34 +79,36 @@ def generate_h(p):
     print(f"OK ({dt:.1f}s)")
     return os.path.exists(h_filename(p))
 
-def run_sim(p, nframes, nthr):
-    """Run C simulator at eps=0.4 only. Returns P_amb or None."""
+def run_sim(p, nframes, nthr, eps):
+    """Run C simulator at given eps. Returns P_amb or None."""
     fname = h_filename(p)
     if not os.path.exists(fname):
         print(f"    FILE NOT FOUND: tried {fname}")
         return None
 
+    eps_str = f"{eps:.6f}"
     cmd = ["./eqr_bec_sim2", "-b", fname, "-f", str(nframes),
-           "-s", "0.4", "-e", "0.4", "-d", "0.01", "-t", str(nthr)]
+           "-s", eps_str, "-e", eps_str, "-d", "0.01", "-t", str(nthr)]
     ret = subprocess.run(cmd, capture_output=True, text=True)
 
     if ret.returncode != 0:
         print(f"    SIM ERROR p={p}: {ret.stderr[:200]}")
         return None
 
-    # Parse output: handle both CSV and space-separated formats
+    # Parse output: find the data line (skip headers)
     for line in ret.stdout.strip().split("\n"):
         line = line.strip()
         if not line or line.startswith("ep") or line.startswith("--") or line.startswith("Code") or line.startswith("Done"):
             continue
-        if line.startswith("0.4") or line.startswith("0,4"):
-            # Try comma-separated first, then space-separated
-            parts = line.replace(",", " ").split()
-            if len(parts) >= 2:
-                try:
+        # Match data lines: first field should be a number close to eps
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                val = float(parts[0])
+                if abs(val - eps) < 0.01:
                     return float(parts[1])
-                except ValueError:
-                    pass
+            except ValueError:
+                continue
 
     print(f"    PARSE FAIL p={p}, stdout:")
     for line in ret.stdout.strip().split("\n")[-5:]:
@@ -119,6 +123,7 @@ def main():
     parser.add_argument("--nmin", type=int, default=190, help="min code length n")
     parser.add_argument("--nmax", type=int, default=1000, help="max code length n")
     parser.add_argument("--count", type=int, default=10, help="number of primes to sample")
+    parser.add_argument("--eps", type=float, default=0.4, help="erasure probability (default 0.4)")
     args = parser.parse_args()
 
     nthr = args.threads if args.threads > 0 else os.cpu_count() or 4
@@ -132,7 +137,7 @@ def main():
     print(f"Target: {len(primes)} primes, p ≡ 7 (mod 8), n ∈ [{args.nmin}, {args.nmax}]")
     print(f"  p = {primes}")
     print(f"  n = {[p+1 for p in primes]}")
-    print(f"  ε = 0.4 fixed, frames = {args.frames}, threads = {nthr}\n")
+    print(f"  ε = {args.eps}, frames = {args.frames}, threads = {nthr}\n")
 
     # Step 1: Generate H matrices
     if not args.skip_gen:
@@ -143,7 +148,7 @@ def main():
         print()
 
     # Step 2: Run simulations
-    print("STEP 2: Simulate at ε = 0.4")
+    print(f"STEP 2: Simulate at ε = {args.eps}")
     print("-" * 50)
     print(f"  {'p':>6}  {'n':>6}  {'P_amb':>14}  {'time':>8}")
     print(f"  {'---':>6}  {'---':>6}  {'---':>14}  {'---':>8}")
@@ -157,10 +162,10 @@ def main():
             print(f"  {p:>6}  {n:>6}  {'0 (skipped)':>14}  {'--':>8}")
             continue
         t0 = time.time()
-        pamb = run_sim(p, args.frames, nthr)
+        pamb = run_sim(p, args.frames, nthr, args.eps)
         dt = time.time() - t0
         results.append((p, n, pamb))
-        ps = f"{pamb:.8f}" if pamb is not None else "N/A"
+        ps = f"{pamb:.6e}" if pamb is not None else "N/A"
         print(f"  {p:>6}  {n:>6}  {ps:>14}  {dt:>7.1f}s")
         if pamb is not None and pamb == 0.0:
             print(f"  >>> P_amb = 0 at n={n}, skipping remaining (larger n will also be 0)")
@@ -171,7 +176,7 @@ def main():
         f.write("p,n,k,P_amb\n")
         for p, n, pamb in results:
             k = n // 2
-            ps = f"{pamb:.10f}" if pamb is not None else ""
+            ps = f"{pamb:.12e}" if pamb is not None else ""
             f.write(f"{p},{n},{k},{ps}\n")
     print(f"\nRaw data saved to delta_raw.csv\n")
 
@@ -183,114 +188,100 @@ def main():
     for p, n, pamb in results:
         if pamb is not None and pamb > 0:
             sqn = math.sqrt(n)
-            nlp = -math.log(pamb)
-            points.append((n, sqn, nlp, pamb))
+            secbits = -math.log2(2 * pamb)
+            points.append((n, sqn, secbits, pamb))
 
-    if len(points) < 2:
-        print("  Not enough data points with P_amb > 0.")
+    if len(points) == 0:
+        print("  No data points with P_amb > 0.")
         print("  Try increasing --frames.")
         return 1
 
-    print(f"\n  {'n':>6}  {'√n':>8}  {'P_amb':>14}  {'-ln(P)':>10}  {'-ln(P)/√n':>12}")
-    print(f"  {'-'*6}  {'-'*8}  {'-'*14}  {'-'*10}  {'-'*12}")
-    for n, sqn, nlp, pf in points:
-        print(f"  {n:>6}  {sqn:>8.3f}  {pf:>14.8f}  {nlp:>10.4f}  {nlp/sqn:>12.6f}")
+    print(f"\n  {'n':>6}  {'√n':>8}  {'P_amb':>14}  {'sec bits':>12}  {'bits/√n':>12}")
+    print(f"  {'-'*6}  {'-'*8}  {'-'*14}  {'-'*12}  {'-'*12}")
+    for n, sqn, sb, pf in points:
+        print(f"  {n:>6}  {sqn:>8.3f}  {pf:>14.6e}  {sb:>12.4f}  {sb/sqn:>12.6f}")
 
-    # δ_min: guaranteed bound for all tested n
-    delta_min = min(nlp / sqn for _, sqn, nlp, _ in points)
+    # Save fit results
+    with open("delta_fit.csv", "w") as f:
+        f.write("n,sqrt_n,P_amb,sec_bits,sec_bits_over_sqrt_n\n")
+        for n, sqn, sb, pf in points:
+            f.write(f"{n},{sqn:.6f},{pf:.12e},{sb:.10f},{sb/sqn:.10f}\n")
+    print(f"\n  Fit data saved to delta_fit.csv")
 
-    # Linear regression: -ln(P) = δ·√n + c
+    if len(points) < 2:
+        print(f"\n  Only {len(points)} data point(s) — skipping fit and plot.")
+        return 0
+
+    # δ₂_min: guaranteed bound for all tested n (in bits)
+    delta2_min = min(sb / sqn for _, sqn, sb, _ in points)
+
+    # Linear regression: -log₂(P) = δ₂·√n + c
     sx  = sum(sq for _, sq, _, _ in points)
-    sy  = sum(nl for _, _, nl, _ in points)
+    sy  = sum(sb for _, _, sb, _ in points)
     sxx = sum(sq*sq for _, sq, _, _ in points)
-    sxy = sum(sq*nl for _, sq, nl, _ in points)
+    sxy = sum(sq*sb for _, sq, sb, _ in points)
     nn  = len(points)
 
     denom = nn * sxx - sx * sx
     if abs(denom) > 1e-15:
-        delta_fit = (nn * sxy - sx * sy) / denom
-        intercept = (sy - delta_fit * sx) / nn
+        delta2_fit = (nn * sxy - sx * sy) / denom
+        intercept = (sy - delta2_fit * sx) / nn
     else:
-        delta_fit, intercept = sxy / sxx, 0
+        delta2_fit, intercept = sxy / sxx, 0
 
-    # R² for delta_fit
-    ss_res = sum((nl - delta_fit * sq - intercept)**2 for _, sq, nl, _ in points)
-    ss_tot = sum((nl - sy/nn)**2 for _, _, nl, _ in points)
+    # R² for delta2_fit
+    ss_res = sum((sb - delta2_fit * sq - intercept)**2 for _, sq, sb, _ in points)
+    ss_tot = sum((sb - sy/nn)**2 for _, _, sb, _ in points)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
 
     print(f"\n  Results ({len(points)} data points):")
     print(f"  ─────────────────────────────────────────")
-    print(f"  δ_min = {delta_min:.6f}  (guaranteed: P ≤ exp(-{delta_min:.4f}·√n) ∀n)")
-    print(f"  δ_fit = {delta_fit:.6f}  (c = {intercept:.4f}, R² = {r2:.6f})")
-    print()
-    print(f"  Interpretation:")
-    print(f"    For ε=0.4, self-dual EQR codes (p≡7 mod 8):")
-    print(f"    P(bit 0 ambiguous) ≤ exp(-{delta_min:.4f} · √n)")
+    print(f"  δ₂_min = {delta2_min:.6f}  (guaranteed: P ≤ 2^(-{delta2_min:.4f}·√n) ∀n)")
+    print(f"  δ₂_fit = {delta2_fit:.6f} (c = {intercept:.4f}, R² = {r2:.6f})")
     print()
 
-    # Save fit results
-    with open("delta_fit.csv", "w") as f:
-        f.write("n,sqrt_n,P_amb,neg_ln_P,neg_ln_P_over_sqrt_n\n")
-        for n, sqn, nlp, pf in points:
-            f.write(f"{n},{sqn:.6f},{pf:.10f},{nlp:.6f},{nlp/sqn:.6f}\n")
-    print(f"  Fit data saved to delta_fit.csv")
+    # Target security levels
+    print(f"  Target security (using δ₂_min = {delta2_min:.4f}):")
+    for target in [40, 60, 80, 128]:
+        n_req = (target / delta2_min) ** 2
+        print(f"    {target:>3}-bit security:  n ≥ {n_req:.0f}  (√n ≥ {math.sqrt(n_req):.1f})")
+    print()
 
     # ── Plot ──
-    print(f"\n  Generating plots ...")
+    print(f"  Generating plot ...")
 
-    ns   = np.array([d[0] for d in points])
     sqns = np.array([d[1] for d in points])
-    nlps = np.array([d[2] for d in points])
-    pambs= np.array([d[3] for d in points])
+    sbs  = np.array([d[2] for d in points])
 
-    sq_range = np.linspace(0, max(sqns) * 1.15, 200)
-    n_range  = sq_range ** 2
+    sq_max = max(max(sqns) * 1.15, 62 / delta2_min * 1.05)
+    sq_range = np.linspace(0, sq_max, 200)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    fig.suptitle(
-        "Self-Dual EQR Codes on BEC (ε=0.4) — Bit-MAP P(ambiguous)",
-        fontsize=14, fontweight="bold", y=0.98)
+    fig, ax = plt.subplots(figsize=(9, 6))
 
-    # Left: -ln(P) vs √n
-    ax1.scatter(sqns, nlps, s=60, c="#2563eb", zorder=5,
-                label="Simulated", edgecolors="white", linewidth=0.5)
-    ax1.plot(sq_range, delta_min * sq_range,
-             "--", color="#ef4444", linewidth=2,
-             label=f"δ_min = {delta_min:.4f}")
-    ax1.plot(sq_range, delta_fit * sq_range + intercept,
-             "-.", color="#f59e0b", linewidth=2,
-             label=f"δ_fit = {delta_fit:.4f}, c={intercept:.2f} (R²={r2:.3f})")
-    for ni, sq, nl, _ in points:
-        ax1.annotate(f"n={ni}", (sq, nl), fontsize=7,
-                     textcoords="offset points", xytext=(5, 5), color="#64748b")
-    ax1.set_xlabel("√n", fontsize=12)
-    ax1.set_ylabel("−ln P(amb)", fontsize=12)
-    ax1.set_title("−ln(P) vs √n", fontsize=12)
-    ax1.legend(fontsize=9, loc="upper left")
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xlim(left=0); ax1.set_ylim(bottom=0)
-
-    # Right: P(amb) vs n (log scale)
-    ax2.semilogy(ns, pambs, "o", color="#2563eb", markersize=7, zorder=5,
-                 label="Simulated", markeredgecolor="white", markeredgewidth=0.5)
-    ax2.semilogy(n_range, np.exp(-delta_min * sq_range),
-                 "--", color="#ef4444", linewidth=2,
-                 label=f"exp(−{delta_min:.4f}·√n)")
-    ax2.semilogy(n_range, np.exp(-delta_fit * sq_range - intercept),
-                 "-.", color="#f59e0b", linewidth=2,
-                 label=f"exp(−{delta_fit:.4f}·√n{intercept:+.2f})")
-    for sec, col in [(40,"#94a3b8"),(60,"#64748b"),(80,"#475569")]:
-        ax2.axhline(2**(-sec), color=col, linewidth=0.8, linestyle=":", alpha=0.5)
-        ax2.text(max(ns)*1.02, 2**(-sec), f"2⁻{sec}", fontsize=8, color=col, va="center")
-    ax2.set_xlabel("Code length n", fontsize=12)
-    ax2.set_ylabel("P(ambiguous)", fontsize=12)
-    ax2.set_title("P(amb) vs n", fontsize=12)
-    ax2.legend(fontsize=9, loc="upper right")
-    ax2.grid(True, alpha=0.3, which="both")
-    ax2.set_xlim(left=0)
+    ax.scatter(sqns, sbs, s=60, c="#2563eb", zorder=5,
+               label="Simulated", edgecolors="white", linewidth=0.5)
+    ax.plot(sq_range, delta2_min * sq_range,
+            "--", color="#ef4444", linewidth=2,
+            label=f"δ₂_min = {delta2_min:.4f}")
+    ax.plot(sq_range, delta2_fit * sq_range + intercept,
+            "-.", color="#f59e0b", linewidth=2,
+            label=f"δ₂_fit = {delta2_fit:.4f}, c={intercept:.2f} (R²={r2:.3f})")
+    for ni, sq, sb, _ in points:
+        ax.annotate(f"n={ni}", (sq, sb), fontsize=7,
+                    textcoords="offset points", xytext=(5, 5), color="#64748b")
+    for sec, col in [(20,"#cbd5e1"),(40,"#94a3b8"),(60,"#64748b")]:
+        ax.axhline(sec, color=col, linewidth=0.8, linestyle=":", alpha=0.5)
+        ax.text(sq_max*0.98, sec, f"{sec}-bit", fontsize=8, color=col, va="bottom", ha="right")
+    ax.set_xlabel("√n", fontsize=12)
+    ax.set_ylabel("Security bits  (−log₂ P_fail)", fontsize=12)
+    ax.set_title(f"Security bits over EQR codes (ε = {args.eps})", fontsize=13)
+    ax.legend(fontsize=9, loc="upper left")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0); ax.set_ylim(0, 62)
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig("delta_fit.png", dpi=150, bbox_inches="tight")
+    print(f"  Plot saved to delta_fit.png")
 
     return 0
 

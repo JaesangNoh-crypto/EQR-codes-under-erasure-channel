@@ -341,7 +341,7 @@ static inline int ge_in_span(const GEWork *w, const uint64_t *v) {
 /* ================================================================
  *  Simulation
  * ================================================================ */
-static double simulate_eps(const HMat *H, double eps, int nframes, int nthr) {
+static double simulate_eps(const HMat *H, double eps, long long nframes, int nthr) {
     long long tot_amb = 0;
     const double log1meps = (eps < 1.0 - 1e-15) ? log(1.0 - eps) : -40.0;
 
@@ -353,8 +353,8 @@ static double simulate_eps(const HMat *H, double eps, int nframes, int nthr) {
                  (uint64_t)(eps * 1e9));
         GEWork *ws = ge_alloc(H->nk, H->nw, H->nk);
 
-        #pragma omp for schedule(dynamic, 64)
-        for (int f = 0; f < nframes; f++) {
+        #pragma omp for schedule(dynamic, 256)
+        for (long long f = 0; f < nframes; f++) {
             ge_reset(ws);
 
             if (eps < 1e-15) {
@@ -414,7 +414,7 @@ int main(int argc, char **argv) {
     int    prime   = 0;
     char  *binfile = NULL;
     char  *csvfile = NULL;
-    int    nframes = 0;
+    long long nframes = 0;
     double eps_s = 0.4, eps_e = 0.5, eps_d = 0.02;
     int    nthr = omp_get_max_threads();
 
@@ -423,7 +423,7 @@ int main(int argc, char **argv) {
         switch (opt) {
         case 'p': prime   = atoi(optarg);  break;
         case 'b': binfile = optarg;        break;
-        case 'f': nframes = atoi(optarg);  break;
+        case 'f': nframes = atoll(optarg);  break;
         case 's': eps_s   = atof(optarg);  break;
         case 'e': eps_e   = atof(optarg);  break;
         case 'd': eps_d   = atof(optarg);  break;
@@ -448,7 +448,7 @@ int main(int argc, char **argv) {
     int n = H->n, k = n - H->nk;
     printf("Code: (%d, %d), R = %.4f, %d words/col, %d threads\n",
            n, k, (double)k/n, H->nw, nthr);
-    printf("Frames: %d, eps: [%.4f, %.4f] step %.4f\n\n", nframes, eps_s, eps_e, eps_d);
+    printf("Frames: %lld, eps: [%.4f, %.4f] step %.4f\n\n", nframes, eps_s, eps_e, eps_d);
 
     FILE *csv = NULL;
     if (csvfile) {
@@ -456,8 +456,8 @@ int main(int argc, char **argv) {
         if (csv) fprintf(csv, "epsilon,P_ambiguous,frames,time_sec\n");
     }
 
-    printf("%-12s %-18s %-10s %s\n", "epsilon", "P(ambiguous)", "frames", "time");
-    printf("%-12s %-18s %-10s %s\n", "--------", "----------", "------", "----");
+    printf("%-12s %-18s %-14s %s\n", "epsilon", "P(ambiguous)", "frames", "time");
+    printf("%-12s %-18s %-14s %s\n", "--------", "----------", "------", "----");
 
     for (double eps = eps_s; eps <= eps_e + eps_d * 0.01; eps += eps_d) {
         if (eps > 1.0) eps = 1.0;
@@ -465,11 +465,11 @@ int main(int argc, char **argv) {
         double pamb = simulate_eps(H, eps, nframes, nthr);
         double dt = omp_get_wtime() - t0;
 
-        printf("%-12.4f %-18.8f %-10d %.3fs\n", eps, pamb, nframes, dt);
+        printf("%-12.4f %-18.6e %-14lld %.3fs\n", eps, pamb, nframes, dt);
         fflush(stdout);
 
         if (csv) {
-            fprintf(csv, "%.6f,%.10f,%d,%.4f\n", eps, pamb, nframes, dt);
+            fprintf(csv, "%.6f,%.12e,%lld,%.4f\n", eps, pamb, nframes, dt);
             fflush(csv);
         }
         if (eps >= 1.0 - 1e-9) break;
