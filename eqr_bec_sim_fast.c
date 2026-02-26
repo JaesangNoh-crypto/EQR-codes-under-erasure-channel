@@ -1,10 +1,13 @@
 /*
- * eqr_bec_sim.c
+ * eqr_bec_sim_fast.c
  *
  * High-performance Monte Carlo simulation of P(ambiguous) for bit 0
  * of extended quadratic residue codes on Binary Erasure Channel.
  *
- * Optimizations:
+ * Optimizations (over baseline eqr_bec_sim.c):
+ *   1. AVX2 SIMD: 256-bit packed XOR (4x throughput vs scalar 64-bit)
+ *   2. No back-reduction: echelon insert ~50% cheaper, span check preserved
+ *   3. Larger OMP chunk (4096) for reduced scheduling overhead
  *   - 64-bit packed GF(2) Gaussian elimination (1 XOR = 64 rows)
  *   - Incremental echelon basis (no full matrix copy per trial)
  *   - OpenMP parallel trials with thread-local workspace
@@ -14,16 +17,16 @@
  *   - Binary H-matrix file input for large codes (from SageMath)
  *
  * Compile:
- *   gcc -O3 -march=native -fopenmp -o eqr_bec_sim eqr_bec_sim.c -lm
+ *   gcc -O3 -march=native -fopenmp -o eqr_bec_sim_fast eqr_bec_sim_fast.c -lm
  *
  * Usage:
- *   ./eqr_bec_sim -p <prime> -f <nframes> [-e start end step] [-t threads] [-o file.csv]
- *   ./eqr_bec_sim -b <H.bin> -f <nframes> [-e start end step] [-t threads] [-o file.csv]
+ *   ./eqr_bec_sim_fast -p <prime> -f <nframes> [-e start end step] [-t threads] [-o file.csv]
+ *   ./eqr_bec_sim_fast -b <H.bin> -f <nframes> [-e start end step] [-t threads] [-o file.csv]
  *
  * Examples:
- *   ./eqr_bec_sim -p 23 -f 100000
- *   ./eqr_bec_sim -p 47 -f 50000 -e 0.35 0.65 0.005 -t 8
- *   ./eqr_bec_sim -b H_152_76.bin -f 50000 -o results.csv
+ *   ./eqr_bec_sim_fast -p 23 -f 100000
+ *   ./eqr_bec_sim_fast -p 47 -f 50000 -e 0.35 0.65 0.005 -t 8
+ *   ./eqr_bec_sim_fast -b H_152_76.bin -f 50000 -o results.csv
  */
 
 #include <stdio.h>
@@ -34,6 +37,25 @@
 #include <time.h>
 #include <omp.h>
 #include <getopt.h>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+/* ================================================================
+ *  Vectorized GF(2) XOR: AVX2 (256-bit) with scalar tail
+ * ================================================================ */
+static inline void xor_vec(uint64_t *dst, const uint64_t *src, int nw) {
+    int i = 0;
+#ifdef __AVX2__
+    for (; i + 4 <= nw; i += 4) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(dst + i));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm256_xor_si256(a, b));
+    }
+#endif
+    for (; i < nw; i++) dst[i] ^= src[i];
+}
 
 /* ================================================================
  *  xoshiro256** PRNG
@@ -293,29 +315,20 @@ static void ge_insert(GEWork *w, const uint64_t *v) {
     int nw = w->nw;
     memcpy(w->tmp, v, nw * sizeof(uint64_t));
 
-    /* Reduce against existing basis */
+    /* Forward reduce against existing basis */
     for (int i = 0; i < w->rank; i++) {
         int pb = w->piv[i];
-        if ((w->tmp[pb >> 6] >> (pb & 63)) & 1) {
-            uint64_t *bi = ge_basis(w, i);
-            for (int u = 0; u < nw; u++) w->tmp[u] ^= bi[u];
-        }
+        if ((w->tmp[pb >> 6] >> (pb & 63)) & 1)
+            xor_vec(w->tmp, ge_basis(w, i), nw);
     }
 
     /* Find pivot (lowest set bit) */
     int p = -1;
     for (int u = 0; u < nw && p < 0; u++)
         if (w->tmp[u]) p = (u << 6) | __builtin_ctzll(w->tmp[u]);
-    if (p < 0 || p >= w->nk) return;  /* zero vector */
+    if (p < 0 || p >= w->nk) return;
 
-    /* Back-reduce: clear bit p in all existing basis vectors */
-    for (int i = 0; i < w->rank; i++) {
-        uint64_t *bi = ge_basis(w, i);
-        if ((bi[p >> 6] >> (p & 63)) & 1)
-            for (int u = 0; u < nw; u++) bi[u] ^= w->tmp[u];
-    }
-
-    /* Store */
+    /* Store — no back-reduction */
     uint64_t *dst = ge_basis(w, w->rank);
     memcpy(dst, w->tmp, nw * sizeof(uint64_t));
     w->piv[w->rank] = p;
@@ -329,10 +342,8 @@ static inline int ge_in_span(const GEWork *w, const uint64_t *v) {
     memcpy(t, v, nw * sizeof(uint64_t));
     for (int i = 0; i < w->rank; i++) {
         int pb = w->piv[i];
-        if ((t[pb >> 6] >> (pb & 63)) & 1) {
-            const uint64_t *bi = w->pool + (size_t)i * nw;
-            for (int u = 0; u < nw; u++) t[u] ^= bi[u];
-        }
+        if ((t[pb >> 6] >> (pb & 63)) & 1)
+            xor_vec(t, w->pool + (size_t)i * nw, nw);
     }
     for (int u = 0; u < nw; u++) if (t[u]) return 0;
     return 1;
@@ -341,8 +352,12 @@ static inline int ge_in_span(const GEWork *w, const uint64_t *v) {
 /* ================================================================
  *  Simulation
  * ================================================================ */
-static double simulate_eps(const HMat *H, double eps, long long nframes, int nthr) {
+static double simulate_eps(const HMat *H, double eps, long long nframes, int nthr, int show_progress) {
     long long tot_amb = 0;
+    long long done_frames = 0;
+    double t_start = omp_get_wtime();
+    double t_last_report = t_start;
+    const double REPORT_INTERVAL = 2.0; /* seconds between progress prints */
     const double log1meps = (eps < 1.0 - 1e-15) ? log(1.0 - eps) : -40.0;
 
     #pragma omp parallel num_threads(nthr) reduction(+:tot_amb)
@@ -352,8 +367,9 @@ static double simulate_eps(const HMat *H, double eps, long long nframes, int nth
         rng_seed(&rng, 42ULL + (uint64_t)tid * 1000003ULL +
                  (uint64_t)(eps * 1e9));
         GEWork *ws = ge_alloc(H->nk, H->nw, H->nk);
+        long long local_done = 0;
 
-        #pragma omp for schedule(dynamic, 256)
+        #pragma omp for schedule(dynamic, 4096)
         for (long long f = 0; f < nframes; f++) {
             ge_reset(ws);
 
@@ -386,8 +402,46 @@ static double simulate_eps(const HMat *H, double eps, long long nframes, int nth
 
             if (ge_in_span(ws, hcol(H, 0)))
                 tot_amb++;
+
+            local_done++;
+            if (show_progress && local_done >= 4096) {
+                #pragma omp atomic
+                done_frames += local_done;
+                local_done = 0;
+
+                if (tid == 0) {
+                    double now = omp_get_wtime();
+                    if (now - t_last_report >= REPORT_INTERVAL) {
+                        t_last_report = now;
+                        long long d = done_frames;
+                        double elapsed = now - t_start;
+                        double pct = 100.0 * d / nframes;
+                        double eta = (d > 0) ? elapsed * (nframes - d) / d : 0;
+                        char eta_buf[32];
+                        if (eta < 60) snprintf(eta_buf, sizeof eta_buf, "%.0fs", eta);
+                        else if (eta < 3600) snprintf(eta_buf, sizeof eta_buf, "%.1fmin", eta / 60);
+                        else snprintf(eta_buf, sizeof eta_buf, "%.1fh", eta / 3600);
+                        int bw = 30, filled = (int)(pct * bw / 100);
+                        char bar[31];
+                        for (int b = 0; b < bw; b++) bar[b] = b < filled ? '#' : '.';
+                        bar[bw] = '\0';
+                        fprintf(stderr,
+                            "\r  [eps=%.4f] |%s| %3.0f%% [%02.0f:%02.0f<%s, %.0f fr/s]   ",
+                            eps, bar, pct,
+                            elapsed / 60, fmod(elapsed, 60),
+                            eta_buf, d / elapsed);
+                    }
+                }
+            }
         }
+        #pragma omp atomic
+        done_frames += local_done;
+
         ge_free(ws);
+    }
+    if (show_progress) {
+        fprintf(stderr, "\r%80s\r", ""); /* clear progress line */
+        fflush(stderr);
     }
     return (double)tot_amb / nframes;
 }
@@ -462,7 +516,7 @@ int main(int argc, char **argv) {
     for (double eps = eps_s; eps <= eps_e + eps_d * 0.01; eps += eps_d) {
         if (eps > 1.0) eps = 1.0;
         double t0 = omp_get_wtime();
-        double pamb = simulate_eps(H, eps, nframes, nthr);
+        double pamb = simulate_eps(H, eps, nframes, nthr, 1);
         double dt = omp_get_wtime() - t0;
 
         printf("%-12.4f %-18.6e %-14lld %.3fs\n", eps, pamb, nframes, dt);

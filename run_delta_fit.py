@@ -80,25 +80,27 @@ def generate_h(p):
     return os.path.exists(h_filename(p))
 
 def run_sim(p, nframes, nthr, eps):
-    """Run C simulator at given eps. Returns P_amb or None."""
+    """Run C simulator at given eps. Returns P_amb or None.
+    stderr (frame progress bar) is passed through to terminal in real-time."""
     fname = h_filename(p)
     if not os.path.exists(fname):
         print(f"    FILE NOT FOUND: tried {fname}")
         return None
 
     eps_str = f"{eps:.6f}"
-    cmd = ["./eqr_bec_sim2", "-b", fname, "-f", str(nframes),
+    cmd = ["./eqr_bec_sim_fast", "-b", fname, "-f", str(nframes),
            "-s", eps_str, "-e", eps_str, "-d", "0.01", "-t", str(nthr)]
-    ret = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
+    stdout, _ = proc.communicate()
 
-    if ret.returncode != 0:
-        print(f"    SIM ERROR p={p}: {ret.stderr[:200]}")
+    if proc.returncode != 0:
+        print(f"    SIM ERROR p={p}")
         return None
 
     # Parse output: find the data line (skip headers)
-    for line in ret.stdout.strip().split("\n"):
+    for line in stdout.strip().split("\n"):
         line = line.strip()
-        if not line or line.startswith("ep") or line.startswith("--") or line.startswith("Code") or line.startswith("Done"):
+        if not line or line.startswith("ep") or line.startswith("--") or line.startswith("Code") or line.startswith("Done") or line.startswith("Load") or line.startswith("Built"):
             continue
         # Match data lines: first field should be a number close to eps
         parts = line.split()
@@ -111,7 +113,7 @@ def run_sim(p, nframes, nthr, eps):
                 continue
 
     print(f"    PARSE FAIL p={p}, stdout:")
-    for line in ret.stdout.strip().split("\n")[-5:]:
+    for line in stdout.strip().split("\n")[-5:]:
         print(f"      [{line}]")
     return None
 
@@ -128,9 +130,9 @@ def main():
 
     nthr = args.threads if args.threads > 0 else os.cpu_count() or 4
 
-    if not os.path.exists("./eqr_bec_sim2"):
-        print("ERROR: ./eqr_bec_sim2 not found. Compile first:")
-        print("  gcc -O3 -march=native -fopenmp -o eqr_bec_sim2 eqr_bec_sim2.c -lm")
+    if not os.path.exists("./eqr_bec_sim_fast"):
+        print("ERROR: ./eqr_bec_sim_fast not found. Compile first:")
+        print("  gcc -O3 -march=native -fopenmp -o eqr_bec_sim_fast eqr_bec_sim_fast.c -lm")
         return 1
 
     primes = find_primes(args.nmin, args.nmax, args.count)
@@ -150,26 +152,44 @@ def main():
     # Step 2: Run simulations
     print(f"STEP 2: Simulate at ε = {args.eps}")
     print("-" * 50)
-    print(f"  {'p':>6}  {'n':>6}  {'P_amb':>14}  {'time':>8}")
-    print(f"  {'---':>6}  {'---':>6}  {'---':>14}  {'---':>8}")
+    def fmt_time(s):
+        if s < 60: return f"{s:.0f}s"
+        if s < 3600: return f"{s/60:.1f}min"
+        return f"{s/3600:.1f}h"
 
     results = []  # (p, n, P_amb)
     stopped_early = False
-    for p in primes:
+    total_start = time.time()
+    elapsed_times = []
+    total = len(primes)
+
+    for idx, p in enumerate(primes, 1):
         n = p + 1
         if stopped_early:
             results.append((p, n, 0.0))
-            print(f"  {p:>6}  {n:>6}  {'0 (skipped)':>14}  {'--':>8}")
+            print(f"  [{idx:>2}/{total}]  p={p:<6} n={n:<6} P=0 (skipped)")
             continue
+
+        remaining = total - idx
+        avg_t = sum(elapsed_times) / len(elapsed_times) if elapsed_times else 0
+        eta_str = f"  overall ETA ~{fmt_time(avg_t * (remaining + 1))}" if elapsed_times else ""
+        print(f"  [{idx:>2}/{total}]  p={p:<6} n={n:<6} running... ({args.frames} frames){eta_str}",
+              flush=True)
+
         t0 = time.time()
         pamb = run_sim(p, args.frames, nthr, args.eps)
         dt = time.time() - t0
+        elapsed_times.append(dt)
         results.append((p, n, pamb))
         ps = f"{pamb:.6e}" if pamb is not None else "N/A"
-        print(f"  {p:>6}  {n:>6}  {ps:>14}  {dt:>7.1f}s")
+        print(f"          => P={ps}  ({dt:.1f}s)")
+
         if pamb is not None and pamb == 0.0:
             print(f"  >>> P_amb = 0 at n={n}, skipping remaining (larger n will also be 0)")
             stopped_early = True
+
+    total_elapsed = time.time() - total_start
+    print(f"\n  Total simulation time: {fmt_time(total_elapsed)}")
 
     # Save raw CSV
     with open("delta_raw.csv", "w") as f:
